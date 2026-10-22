@@ -37,8 +37,10 @@ Prefer no installer? Download the portable `claude-code-tts.exe` instead and run
 | Windows rate | -10 – 10 for the built-in voice. |
 | Max characters | Long replies are cut off after this many characters (0 = no limit). |
 | Read code blocks | Off by default: code blocks are announced as "code block omitted". |
+| Stop hotkey | Press it anywhere in Windows to stop the reply being read. Default **Ctrl+Alt+S**; pick *Key only* for a single function key like **F8**, or *Off*. While set, the key does nothing else in other programs. A small background listener (`claude-code-tts.exe --listen`) starts at sign-in to catch it. You can also run `claude-code-tts.exe --stop`. |
 | Test | Type something and click **Speak** to hear the current settings. **Stop** silences the current reply. |
 | Remove hook | Stops Claude Code from speaking without uninstalling anything. |
+| Check for updates | Looks for a newer release on GitHub. The installed app downloads and runs the new installer; the portable exe opens the download page. |
 
 All settings except the hook take effect immediately: they're stored in `~/.claude/tts/config.json`, which the hook reads every time.
 
@@ -52,6 +54,7 @@ All settings except the hook take effect immediately: they're stored in `~/.clau
     piper/                   Piper engine
     voices/                  downloaded voice models
     voices.json              cached voice catalog
+HKCU\...\CurrentVersion\Run  "ClaudeCodeTTSHotkey" starts the stop hotkey listener at sign-in
 ```
 
 ## Uninstall

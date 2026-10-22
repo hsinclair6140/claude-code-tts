@@ -13,7 +13,9 @@ if (-not (Test-Path .venv)) { py -3 -m venv .venv }
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 
 .\.venv\Scripts\pyinstaller --noconfirm --onefile --windowed --name claude-code-tts `
+    --icon "$PSScriptRoot\assets\icon.ico" `
     --add-data "$PSScriptRoot\assets\speak.ps1;." `
+    --add-data "$PSScriptRoot\assets\icon.ico;." `
     --distpath dist --workpath build --specpath build src\claude_tts.py
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 

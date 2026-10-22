@@ -6,24 +6,31 @@ Windows voice. Everything runs offline once the engine and a voice are downloade
 
 Usage:
     claude-code-tts.exe              open the settings window
+    claude-code-tts.exe --stop       stop the reply currently being read
+    claude-code-tts.exe --listen     run the stop hotkey listener (started at sign-in)
     claude-code-tts.exe --uninstall  remove the hook and all downloaded files
 """
 
+import ctypes
 import json
 import os
 import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import urllib.request
+import webbrowser
+import winreg
 import zipfile
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 APP_NAME = "Claude Code TTS"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_FILE = CLAUDE_DIR / "settings.json"
@@ -34,8 +41,18 @@ PIPER_EXE = TTS_DIR / "piper" / "piper.exe"
 VOICES_DIR = TTS_DIR / "voices"
 VOICES_CACHE = TTS_DIR / "voices.json"
 
+# The stop hotkey listener: a windowless background process started at sign-in.
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "ClaudeCodeTTSHotkey"
+LISTENER_MUTEX = "Local\\ClaudeCodeTTSHotkeyListener"
+LISTENER_QUIT_EVENT = "Local\\ClaudeCodeTTSHotkeyQuit"
+
 PIPER_URL = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_windows_amd64.zip"
 VOICES_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
+LATEST_RELEASE_API = "https://api.github.com/repos/hsinclair6140/claude-code-tts/releases/latest"
+RELEASES_PAGE = "https://github.com/hsinclair6140/claude-code-tts/releases/latest"
+# Where the installer puts the app (DefaultDirName in installer/setup.iss).
+INSTALL_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Programs" / "Claude Code TTS"
 
 # Script paths a hook of ours may point at (current layout and the original manual setup).
 OUR_SCRIPT_MARKERS = (".claude/tts/speak.ps1", ".claude/hooks/speak.ps1")
@@ -48,7 +65,15 @@ DEFAULT_CONFIG = {
     "sapiRate": 1,
     "maxChars": 2000,
     "readCode": False,
+    "stopHotkey": "Ctrl+Alt+S",
 }
+
+HOTKEY_MODIFIERS = ["", "Ctrl", "Alt", "Shift", "Ctrl+Alt", "Ctrl+Shift", "Alt+Shift", "Ctrl+Alt+Shift"]
+MODIFIER_FLAGS = {"Alt": 0x1, "Ctrl": 0x2, "Shift": 0x4}  # MOD_ALT, MOD_CONTROL, MOD_SHIFT
+# F12 is reserved by Windows for debuggers. Letters and digits need Ctrl or Alt so the
+# hotkey can't swallow ordinary typing.
+FUNCTION_KEYS = [f"F{n}" for n in range(1, 12)]
+TYPING_KEYS = [chr(c) for c in range(ord("A"), ord("Z") + 1)] + [str(d) for d in range(10)]
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -247,14 +272,178 @@ def run_speak(payload=None, stop=False):
     proc.stdin.close()
 
 
+def split_hotkey(hotkey):
+    """Split "Ctrl+Alt+S" into ("Ctrl+Alt", "S") and "F8" into ("", "F8").
+    Returns None when the hotkey is off or invalid."""
+    modifiers, _, key = (hotkey or "").rpartition("+")
+    if modifiers not in HOTKEY_MODIFIERS or key not in hotkey_keys(modifiers):
+        return None
+    return modifiers, key
+
+
+def hotkey_keys(modifiers):
+    """Keys that may be combined with modifiers."""
+    if "Ctrl" in modifiers or "Alt" in modifiers:
+        return TYPING_KEYS + FUNCTION_KEYS
+    return FUNCTION_KEYS
+
+
+def register_hotkey(hotkey, hotkey_id=1):
+    """Register hotkey for the calling thread. Returns False if it's invalid or taken."""
+    parts = split_hotkey(hotkey)
+    if not parts:
+        return False
+    modifiers, key = parts
+    flags = 0x4000  # MOD_NOREPEAT
+    for name in filter(None, modifiers.split("+")):
+        flags |= MODIFIER_FLAGS[name]
+    vk = 0x70 + int(key[1:]) - 1 if key in FUNCTION_KEYS else ord(key)
+    return bool(ctypes.windll.user32.RegisterHotKey(None, hotkey_id, flags, vk))
+
+
+def hotkey_available(hotkey):
+    """True if no other program has claimed hotkey."""
+    if not register_hotkey(hotkey, hotkey_id=2):
+        return False
+    ctypes.windll.user32.UnregisterHotKey(None, 2)
+    return True
+
+
+def kernel32():
+    k32 = ctypes.windll.kernel32
+    for name in ("CreateMutexW", "OpenMutexW", "CreateEventW", "OpenEventW"):
+        getattr(k32, name).restype = wintypes.HANDLE
+    return k32
+
+
+def listen_for_hotkey():
+    """Run the stop hotkey listener until the hotkey is turned off, the app is uninstalled,
+    or stop_listener() is called. Picks up hotkey changes from config.json as they happen."""
+    k32, user32 = kernel32(), ctypes.windll.user32
+    mutex = k32.CreateMutexW(None, True, LISTENER_MUTEX)
+    if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS: another listener is running
+        return
+    quit_event = wintypes.HANDLE(k32.CreateEventW(None, True, False, LISTENER_QUIT_EVENT))
+    registered = mtime = None
+    msg = wintypes.MSG()
+    while True:
+        try:
+            current = CONFIG_FILE.stat().st_mtime
+        except OSError:
+            break  # uninstalled
+        if current != mtime:
+            mtime = current
+            hotkey = load_config()["stopHotkey"]
+            if not split_hotkey(hotkey):
+                break  # turned off
+            if hotkey != registered:
+                if registered:
+                    user32.UnregisterHotKey(None, 1)
+                registered = hotkey if register_hotkey(hotkey) else None
+        # Wake on the quit event, a hotkey press, or every second to check config.json.
+        if user32.MsgWaitForMultipleObjects(1, ctypes.byref(quit_event), False, 1000, 0x4FF) == 0:
+            break
+        while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+            if msg.message == 0x312 and SPEAK_SCRIPT.exists():  # WM_HOTKEY
+                run_speak(stop=True)
+    k32.ReleaseMutex(mutex)
+
+
+def listener_running():
+    k32 = kernel32()
+    mutex = k32.OpenMutexW(0x100000, False, LISTENER_MUTEX)  # SYNCHRONIZE
+    if mutex:
+        k32.CloseHandle(mutex)
+    return bool(mutex)
+
+
+def listener_command():
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--listen"]
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return [str(pythonw if pythonw.exists() else sys.executable), str(Path(__file__).resolve()), "--listen"]
+
+
+def update_listener(hotkey):
+    """Start the listener at sign-in and now when hotkey is set; otherwise stop starting it.
+    A running listener exits by itself once config.json says the hotkey is off."""
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+        if split_hotkey(hotkey):
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, subprocess.list2cmdline(listener_command()))
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_VALUE)
+            except FileNotFoundError:
+                pass
+    if split_hotkey(hotkey) and not listener_running():
+        subprocess.Popen(listener_command(), close_fds=True,
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+
+
+def stop_listener():
+    """Ask a running listener to exit and wait for it, so its exe can be replaced or deleted."""
+    k32 = kernel32()
+    event = k32.OpenEventW(0x2, False, LISTENER_QUIT_EVENT)  # EVENT_MODIFY_STATE
+    if not event:
+        return
+    k32.SetEvent(event)
+    k32.CloseHandle(event)
+    mutex = k32.OpenMutexW(0x100000, False, LISTENER_MUTEX)  # SYNCHRONIZE
+    if mutex:
+        if k32.WaitForSingleObject(mutex, 5000) in (0, 0x80):  # acquired or abandoned
+            k32.ReleaseMutex(mutex)
+        k32.CloseHandle(mutex)
+
+
 def uninstall_everything():
     if SPEAK_SCRIPT.exists():
         run_speak(stop=True)
+    stop_listener()
+    try:
+        update_listener("")
+    except OSError:
+        pass
     try:
         remove_hook()
     except (OSError, ValueError):
         pass
     shutil.rmtree(TTS_DIR, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Updates
+# ---------------------------------------------------------------------------
+
+def parse_version(text):
+    """Turn "v1.2.0" into (1, 2, 0). Returns None if text isn't a version number."""
+    parts = (text or "").strip().lstrip("vV").split(".")
+    if not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def update_available(latest_tag, current=APP_VERSION):
+    latest = parse_version(latest_tag)
+    return latest is not None and latest > parse_version(current)
+
+
+def latest_release():
+    """Return (tag, release page URL, installer download URL or None) for the newest GitHub release."""
+    req = urllib.request.Request(LATEST_RELEASE_API, headers={
+        "User-Agent": f"claude-code-tts/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        release = json.load(resp)
+    installer = next((asset["browser_download_url"] for asset in release.get("assets", [])
+                      if asset["name"].startswith("ClaudeCodeTTS-Setup-") and asset["name"].endswith(".exe")),
+                     None)
+    return release.get("tag_name", ""), release.get("html_url", RELEASES_PAGE), installer
+
+
+def running_installed_copy():
+    """True for the installer's copy of the app; False for the portable exe or running from source."""
+    if not getattr(sys, "frozen", False):
+        return False
+    return os.path.normcase(Path(sys.executable).parent) == os.path.normcase(INSTALL_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +460,15 @@ class App:
         self.save_job = None
 
         root.title(f"{APP_NAME} {APP_VERSION}")
+        root.iconbitmap(default=str(bundled_file("icon.ico")))
         root.resizable(False, False)
         self.build()
         self.refresh_status()
+        if hook_installed():
+            try:
+                update_listener(self.config["stopHotkey"])
+            except OSError:
+                pass
         self.run_task("Loading voice list...", self.task_load_catalog)
         root.after(100, self.pump_events)
 
@@ -300,6 +495,8 @@ class App:
         self.install_btn.pack(fill="x", pady=1)
         self.remove_btn = ttk.Button(buttons, text="Remove hook", command=self.on_remove_hook)
         self.remove_btn.pack(fill="x", pady=1)
+        self.update_btn = ttk.Button(buttons, text="Check for updates", command=self.on_check_updates)
+        self.update_btn.pack(fill="x", pady=1)
 
         # Voice
         voice = ttk.LabelFrame(main, text="Voice", padding=8)
@@ -360,6 +557,20 @@ class App:
         self.code_var = tk.BooleanVar(value=self.config["readCode"])
         ttk.Checkbutton(reading, text="Read code blocks (otherwise they are skipped)", variable=self.code_var,
                         command=self.on_change).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(reading, text="Stop hotkey:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        hotkey = ttk.Frame(reading)
+        hotkey.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        self.hotkey_mod_var = tk.StringVar()
+        self.hotkey_key_var = tk.StringVar()
+        mod_box = ttk.Combobox(hotkey, textvariable=self.hotkey_mod_var, state="readonly", width=14,
+                               values=["Off", "Key only"] + HOTKEY_MODIFIERS[1:])
+        mod_box.pack(side="left")
+        ttk.Label(hotkey, text="+").pack(side="left", padx=4)
+        self.hotkey_key_box = ttk.Combobox(hotkey, textvariable=self.hotkey_key_var, state="readonly", width=4)
+        self.hotkey_key_box.pack(side="left")
+        for box in (mod_box, self.hotkey_key_box):
+            box.bind("<<ComboboxSelected>>", lambda e: self.on_hotkey_change())
+        self.show_hotkey(self.config["stopHotkey"])
 
         # Test
         test = ttk.LabelFrame(main, text="Test", padding=8)
@@ -433,6 +644,40 @@ class App:
         self.update_slider_labels()
         self.status_var.set("Settings saved.")
 
+    def show_hotkey(self, hotkey):
+        parts = split_hotkey(hotkey)
+        modifiers, key = parts or ("Off", "")
+        self.hotkey_mod_var.set(modifiers or "Key only")
+        self.hotkey_key_box.config(values=hotkey_keys(modifiers) if parts else [],
+                                   state="readonly" if parts else "disabled")
+        self.hotkey_key_var.set(key)
+
+    def selected_hotkey(self):
+        modifiers = self.hotkey_mod_var.get()
+        if modifiers == "Off":
+            return ""
+        modifiers = "" if modifiers == "Key only" else modifiers
+        keys = hotkey_keys(modifiers)
+        key = self.hotkey_key_var.get()
+        key = key if key in keys else "F8" if "F8" in keys else keys[0]
+        return f"{modifiers}+{key}" if modifiers else key
+
+    def on_hotkey_change(self):
+        old, hotkey = self.config["stopHotkey"], self.selected_hotkey()
+        if hotkey and hotkey != old and not hotkey_available(hotkey):
+            self.show_hotkey(old)
+            messagebox.showwarning(APP_NAME, f"{hotkey} is already used by another program. Pick a different key.")
+            return
+        self.show_hotkey(hotkey)
+        self.config["stopHotkey"] = hotkey
+        save_config(self.config)
+        try:
+            update_listener(hotkey)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't start the hotkey listener.\n\n{e}")
+            return
+        self.status_var.set(f"Press {hotkey} anywhere to stop reading." if hotkey else "Stop hotkey turned off.")
+
     # ---- voice list ----
     def fill_languages(self):
         langs = sorted({voice_language(info) for info in self.catalog.values()})
@@ -488,21 +733,36 @@ class App:
         if SPEAK_SCRIPT.exists():
             run_speak(stop=True)
 
+    def on_check_updates(self):
+        self.run_task("Checking for updates...", self.task_check_updates)
+
+    def offer_update(self, tag, page, installer):
+        version = tag.lstrip("vV")
+        intro = f"Version {version} is available (you have {APP_VERSION})."
+        if installer and running_installed_copy():
+            if messagebox.askyesno(APP_NAME, f"{intro}\n\nDownload and install it now? "
+                                             "This window closes while the installer runs."):
+                self.run_task(f"Downloading version {version}...", self.task_install_update, installer)
+        elif messagebox.askyesno(APP_NAME, f"{intro}\n\nOpen the download page?"):
+            webbrowser.open(page)
+
     # ---- background tasks ----
     def run_task(self, message, fn, *args):
         if self.busy:
             return
         self.busy = True
-        self.install_btn.state(["disabled"])
+        for button in (self.install_btn, self.update_btn):
+            button.state(["disabled"])
         self.status_var.set(message)
         self.progress.config(value=0)
 
         def worker():
+            then = None
             try:
-                fn(*args)
+                then = fn(*args)  # a task may return a callback to run on the UI thread once it's done
             except Exception as e:  # report any failure in the UI instead of dying silently
                 self.events.put(("error", str(e)))
-            self.events.put(("done", None))
+            self.events.put(("done", then))
         threading.Thread(target=worker, daemon=True).start()
 
     def report_progress(self, label):
@@ -530,10 +790,31 @@ class App:
                 self.status_var.set("Something went wrong.")
             elif kind == "done":
                 self.busy = False
-                self.install_btn.state(["!disabled"])
+                for button in (self.install_btn, self.update_btn):
+                    button.state(["!disabled"])
                 self.progress.config(value=0)
                 self.refresh_status()
+                if data:
+                    data()
         self.root.after(100, self.pump_events)
+
+    def task_check_updates(self):
+        try:
+            tag, page, installer = latest_release()
+        except (OSError, ValueError):
+            self.events.put(("status", "Couldn't reach GitHub to check for updates."))
+            return None
+        if not update_available(tag):
+            self.events.put(("status", f"You have the latest version ({APP_VERSION})."))
+            return None
+        return lambda: self.offer_update(tag, page, installer)
+
+    def task_install_update(self, url):
+        setup = Path(tempfile.gettempdir()) / url.rsplit("/", 1)[-1]
+        download(url, setup, self.report_progress("Downloading update:"))
+        subprocess.Popen([str(setup)])
+        # Quit so the installer can replace the exe; it stops the hotkey listener itself.
+        self.events.put(("call", self.root.quit))
 
     def task_load_catalog(self):
         catalog = load_voice_catalog()
@@ -561,11 +842,22 @@ class App:
             download_voice(voice_id, info, self.report_progress("Downloading voice:"))
         save_config(self.config)
         install_hook()
+        update_listener(self.config["stopHotkey"])
         self.events.put(("call", self.fill_voices))
         self.events.put(("status", "Installed. Restart Claude Code (or open /hooks) to start hearing replies."))
 
 
 def main():
+    if "--listen" in sys.argv:
+        listen_for_hotkey()
+        return
+    if "--quit-listener" in sys.argv:
+        stop_listener()
+        return
+    if "--stop" in sys.argv:
+        if SPEAK_SCRIPT.exists():
+            run_speak(stop=True)
+        return
     if "--uninstall" in sys.argv:
         uninstall_everything()
         return
