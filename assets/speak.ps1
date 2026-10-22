@@ -4,7 +4,8 @@
 #
 #   speak.ps1            read a Stop-hook JSON payload from stdin and speak it
 #   speak.ps1 -Stop      stop whatever is currently being read
-param([switch]$Stop)
+#   speak.ps1 -Print     print the text that would be spoken instead of speaking it
+param([switch]$Stop, [switch]$Print)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $root    = $PSScriptRoot
@@ -44,7 +45,7 @@ $raw = [Console]::In.ReadToEnd()
 try { $hook = $raw | ConvertFrom-Json } catch { exit 0 }
 
 # The app's Speak button sets claude_tts_test so it works even while reading is off.
-if (-not $cfg.enabled -and -not $hook.claude_tts_test) { exit 0 }
+if (-not $cfg.enabled -and -not $hook.claude_tts_test -and -not $Print) { exit 0 }
 
 # Prefer the field Claude Code passes directly; fall back to the transcript.
 $text = $hook.last_assistant_message
@@ -68,13 +69,32 @@ if ($cfg.readCode) {
 }
 $clean = [regex]::Replace($clean, '\[([^\]]+)\]\([^)]+\)', '$1')
 $clean = [regex]::Replace($clean, 'https?://\S+', ' link ')
-$clean = [regex]::Replace($clean, '[`*_#>|~]', '')
+
+# File paths are read as just the file name: C:\Dev\app\setup.exe -> setup.exe, src/app.py:42 -> app.py.
+$seg = '[^\s\\/:*?"<>|,;()\[\]{}`]+'
+$pathToLeaf = {
+    param($m)
+    $path = [regex]::Replace($m.Value, '(:\d+)+$', '').TrimEnd('\', '/')
+    $leaf = ($path -split '[\\/]' | Where-Object { $_ })[-1]
+    # A relative path only counts when it ends in a file name, so "and/or" and dates are left alone.
+    if ($m.Groups['rel'].Success -and $leaf.TrimEnd('.') -notmatch '\.[A-Za-z0-9]{1,8}$') { return $m.Value }
+    return $leaf
+}
+# Paths with spaces are only safe to spot inside a `code span`.
+$clean = [regex]::Replace($clean, '`((?:[A-Za-z]:|\\\\|~|%\w+%|\$env:\w+)[\\/][^`"<>|*?\r\n]*)`', { param($m) & $pathToLeaf $m.Groups[1] })
+$absolute = '(?:[A-Za-z]:[\\/]|\\\\|(?:~|%\w+%|\$env:\w+|\.{1,2})[\\/]|/(?=' + $seg + '/))' + $seg + '(?:[\\/]' + $seg + ')*[\\/]?(?::\d+)*'
+$relative = '(?<rel>)(?:' + $seg + '[\\/])+' + $seg + '(?::\d+)*'
+$clean = [regex]::Replace($clean, '(?<![\w\\/.:~%$-])(?:' + $absolute + '|' + $relative + ')', $pathToLeaf)
+
+$clean = [regex]::Replace($clean, '[`*#>|~]', '')
+$clean = $clean.Replace('_', ' ')  # snake_case names read as words, not glued together
 $clean = [regex]::Replace($clean, '(?m)^\s*[-:]{3,}\s*$', '')
 $clean = [regex]::Replace($clean, '(?m)^\s*[-+]\s+', '')
 $clean = [regex]::Replace($clean, '\s+', ' ').Trim()
 $max = [int]$cfg.maxChars
 if ($max -gt 0 -and $clean.Length -gt $max) { $clean = $clean.Substring(0, $max) + '. Reply truncated.' }
 if ([string]::IsNullOrWhiteSpace($clean)) { exit 0 }
+if ($Print) { [Console]::Out.Write($clean); exit 0 }
 
 # Cut off any reply still being read so they don't overlap.
 Stop-Speaking

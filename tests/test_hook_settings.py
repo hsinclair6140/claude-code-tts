@@ -1,6 +1,7 @@
 """Tests for the settings.json hook merge logic. Run: python -m unittest discover tests"""
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -96,6 +97,27 @@ class StopHotkeyTest(unittest.TestCase):
         # Letters without Ctrl or Alt would swallow typing; F12 is reserved by Windows.
         for hotkey in ("", None, "S", "Shift+S", "F12", "Ctrl+Alt+Space", "Win+Alt+S"):
             self.assertIsNone(claude_tts.split_hotkey(hotkey))
+
+
+class SpokenTextTest(unittest.TestCase):
+    """What speak.ps1 would read aloud, via its -Print switch."""
+
+    def spoken(self, text):
+        script = Path(__file__).resolve().parent.parent / "assets" / "speak.ps1"
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-Print"],
+            input=json.dumps({"last_assistant_message": text}), capture_output=True, text=True,
+            encoding="utf-8").stdout
+
+    def test_paths_read_as_file_names(self):
+        self.assertEqual(
+            self.spoken("Run C:\\Dev\\app\\dist\\Setup-1.1.0.exe, then edit `src/claude_tts.py:487`, "
+                        "~/.claude/tts/config.json and `C:\\Program Files\\Inno Setup 6\\ISCC.exe`."),
+            "Run Setup-1.1.0.exe, then edit claude tts.py, config.json and ISCC.exe.")
+
+    def test_slashes_that_are_not_paths_are_kept(self):
+        text = "Use /voice, and/or TCP/IP. It shipped on 10/22/2026, a 50/50 split. Edit README.md."
+        self.assertEqual(self.spoken(text), text)
 
 
 class UpdateCheckTest(unittest.TestCase):

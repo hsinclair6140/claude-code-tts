@@ -9,7 +9,7 @@ Pair it with Claude Code's built-in `/voice` dictation for a hands-free, two-way
 ## How it works
 
 - Claude Code runs a **Stop hook** every time it finishes a reply.
-- The hook runs `speak.ps1`, which takes the reply, strips markdown, code blocks and URLs, and speaks it with:
+- The hook runs `speak.ps1`, which takes the reply, strips markdown, code blocks and URLs, shortens file paths to just the file name, and speaks it with:
   - **[Piper](https://github.com/rhasspy/piper)** — a fast, local neural text-to-speech engine with 100+ voices in many languages (default), or
   - **the built-in Windows voice** (SAPI) as a fallback.
 - A new reply cuts off the one still being read, so they never overlap.
