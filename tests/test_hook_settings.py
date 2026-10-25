@@ -115,6 +115,16 @@ class SpokenTextTest(unittest.TestCase):
                         "~/.claude/tts/config.json and `C:\\Program Files\\Inno Setup 6\\ISCC.exe`."),
             "Run Setup-1.1.0.exe, then edit claude tts.py, config.json and ISCC.exe.")
 
+    def test_colons_read_as_pauses(self):
+        self.assertEqual(
+            self.spoken("Changes:\n- one\n- two\n\nNote: it's done. **Fix:** at 10:30, see `src/app.py:42`."),
+            "Changes. one. two. Note, it's done. Fix, at 10 30, see app.py.")
+
+    def test_line_ends_are_pauses(self):
+        self.assertEqual(
+            self.spoken("## Status\nProgress: about 35%\n\nNext is the mosquito example, with the\n- first item;\n- done!"),
+            "Status. Progress, about 35%. Next is the mosquito example, with the. first item; done!")
+
     def test_slashes_that_are_not_paths_are_kept(self):
         text = "Use /voice, and/or TCP/IP. It shipped on 10/22/2026, a 50/50 split. Edit README.md."
         self.assertEqual(self.spoken(text), text)

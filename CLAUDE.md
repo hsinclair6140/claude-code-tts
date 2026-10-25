@@ -25,21 +25,25 @@ User-facing docs are in `README.md`.
 - **speak.ps1** reads the hook JSON from stdin (`last_assistant_message`, falling back to the
   transcript), strips markdown, code blocks, URLs and file paths, then speaks. Only one reply plays
   at a time: the PID of the speaking process is in `%TEMP%\claude_tts.pid`, and a new reply or
-  `speak.ps1 -Stop` kills it.
+  `speak.ps1 -Stop` kills it. Speech is always rendered to a WAV (SAPI too), padded with `leadInMs` of
+  leading silence so waking audio devices don't clip the first words, and played with WPF
+  `MediaPlayer` so it can pause. `speak.ps1 -Pause` toggles `%TEMP%\claude_tts.paused`, which the
+  playback loop polls.
 - **Settings** live in `~/.claude/tts/config.json`. The script re-reads them on every reply, so changes
   take effect without a restart. Defaults are duplicated: `DEFAULT_CONFIG` in `claude_tts.py` and `$cfg` in
-  `speak.ps1`. Keep the speech-related keys in sync (`stopHotkey` is app-only).
-- **Stop hotkey listener:** `claude-code-tts.exe --listen` is a windowless process that calls
-  `RegisterHotKey` and runs `speak.ps1 -Stop` on the key. It starts at sign-in from the
+  `speak.ps1`. Keep the speech-related keys in sync (`stopHotkey` and `pauseHotkey` are app-only).
+- **Hotkey listener:** `claude-code-tts.exe --listen` is a windowless process that calls
+  `RegisterHotKey` for the stop and pause hotkeys (ids in `HOTKEYS`) and runs `speak.ps1 -Stop` or
+  `-Pause`. It starts at sign-in from the
   `HKCU\...\CurrentVersion\Run` value `ClaudeCodeTTSHotkey`, polls config.json's mtime every second to
-  pick up a new key, and exits when the hotkey is off or config.json is gone. A named mutex keeps it
+  pick up a new key, and exits when both hotkeys are off or config.json is gone. A named mutex keeps it
   single-instance; a named event (`--quit-listener` / `stop_listener()`) asks it to exit. The installer
   calls `--quit-listener` before replacing the exe. Windows shortcut hotkeys were tried first and
   dropped: they can't be a bare key like F8 and lag about a second.
 - **Update check:** queries the GitHub API for the latest release of `hsinclair6140/claude-code-tts`
   and compares it with `APP_VERSION`. The installed copy downloads the asset named
   `ClaudeCodeTTS-Setup-*.exe`, runs it, and quits. The portable exe opens the release page instead.
-- **Command-line options:** `--stop`, `--listen`, `--quit-listener`, `--uninstall`. The installer's
+- **Command-line options:** `--stop`, `--pause`, `--listen`, `--quit-listener`, `--uninstall`. The installer's
   uninstaller runs `--uninstall`, which also stops the listener and removes the Run value.
 
 ## Files on the user's machine

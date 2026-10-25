@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build",
+      "detail": "Tests, exe and installer into dist\\",
+      "type": "process",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}\\build.ps1"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Reinstall",
+      "detail": "Build, run the installer silently, and copy speak.ps1 into ~/.claude/tts",
+      "type": "process",
+      "command": "powershell",
+      "args": [
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+        "$ErrorActionPreference = 'Stop'; $setup = Get-ChildItem '${workspaceFolder}\\dist\\ClaudeCodeTTS-Setup-*.exe' | Sort-Object LastWriteTime | Select-Object -Last 1; Write-Host \"Installing $($setup.Name)\"; $log = Join-Path $env:TEMP 'claude-code-tts-setup.log'; $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', \"/LOG=`\"$log`\"\" -PassThru; $p.WaitForExit(); $exe = Join-Path $env:LOCALAPPDATA 'Programs\\Claude Code TTS\\claude-code-tts.exe'; if ((Get-FileHash $exe).Hash -ne (Get-FileHash '${workspaceFolder}\\dist\\claude-code-tts.exe').Hash) { throw \"Installed exe was not replaced. See $log\" }; Write-Host 'Installed exe matches the build.'; $tts = Join-Path $HOME '.claude\\tts'; if (Test-Path $tts) { Copy-Item '${workspaceFolder}\\assets\\speak.ps1' $tts; Write-Host \"Copied speak.ps1 to $tts\" } else { Write-Host 'No ~/.claude/tts yet: open the app and click Install / Repair.' }"
+      ],
+      "dependsOn": "Build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}

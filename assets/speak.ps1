@@ -4,22 +4,35 @@
 #
 #   speak.ps1            read a Stop-hook JSON payload from stdin and speak it
 #   speak.ps1 -Stop      stop whatever is currently being read
+#   speak.ps1 -Pause     pause the reply being read, or resume it if it's paused
 #   speak.ps1 -Print     print the text that would be spoken instead of speaking it
-param([switch]$Stop, [switch]$Print)
+param([switch]$Stop, [switch]$Pause, [switch]$Print)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $root    = $PSScriptRoot
 $pidFile = Join-Path $env:TEMP 'claude_tts.pid'
+$pauseFile = Join-Path $env:TEMP 'claude_tts.paused'  # exists while the speaking process should be paused
 
 function Stop-Speaking {
     if (Test-Path $pidFile) {
         $old = Get-Content $pidFile
-        if ($old -and $old -ne $PID) { Stop-Process -Id $old -Force }
+        if ($old -and $old -ne $PID) {
+            Stop-Process -Id $old -Force
+            Wait-Process -Id $old -Timeout 2
+            Remove-Item (Join-Path $env:TEMP "claude_tts_$old.wav")
+        }
         Remove-Item $pidFile
     }
+    Remove-Item $pauseFile
 }
 
 if ($Stop) { Stop-Speaking; exit 0 }
+if ($Pause) {
+    $speaking = (Test-Path $pidFile) -and (Get-Process -Id (Get-Content $pidFile))
+    if ((Test-Path $pauseFile) -or -not $speaking) { Remove-Item $pauseFile }
+    else { New-Item -ItemType File $pauseFile | Out-Null }
+    exit 0
+}
 
 # ---- settings (defaults are used for anything missing from config.json) ----
 $cfg = [ordered]@{
@@ -30,6 +43,7 @@ $cfg = [ordered]@{
     sapiRate  = 1                   # -10 - 10, used by the Windows voice
     maxChars  = 2000                # longer replies are cut off; 0 = no limit
     readCode  = $false              # read fenced code blocks instead of skipping them
+    leadInMs  = 750                 # silence before speech, so a waking audio device doesn't clip the first words
 }
 $cfgPath = Join-Path $root 'config.json'
 if (Test-Path $cfgPath) {
@@ -90,6 +104,12 @@ $clean = [regex]::Replace($clean, '[`*#>|~]', '')
 $clean = $clean.Replace('_', ' ')  # snake_case names read as words, not glued together
 $clean = [regex]::Replace($clean, '(?m)^\s*[-:]{3,}\s*$', '')
 $clean = [regex]::Replace($clean, '(?m)^\s*[-+]\s+', '')
+# Pause at the end of each line, so a heading or list item doesn't run into the next line.
+$clean = [regex]::Replace($clean, '(?m)([^\s.!?,;:])[ \t]*\r?$', '$1.')
+# Colons are a pause, never the word "colon": "Changes:" ends a sentence, "Note: x" -> "Note, x", 10:30 -> 10 30.
+$clean = [regex]::Replace($clean, '(?m):[ \t]*\r?$', '.')
+$clean = [regex]::Replace($clean, ':\s+', ', ')
+$clean = $clean.Replace(':', ' ')
 $clean = [regex]::Replace($clean, '\s+', ' ').Trim()
 $max = [int]$cfg.maxChars
 if ($max -gt 0 -and $clean.Length -gt $max) { $clean = $clean.Substring(0, $max) + '. Reply truncated.' }
@@ -111,16 +131,67 @@ if ($cfg.engine -eq 'piper' -and (Test-Path $piper) -and (Test-Path $voice)) {
     $lengthScale = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.###}', 1.0 / $speed)
     $clean | & $piper --model $voice --length_scale $lengthScale --output_file $wav 2>$null | Out-Null
 }
-if (Test-Path $wav) {
-    $player = New-Object System.Media.SoundPlayer $wav
-    $player.PlaySync()
-    $player.Dispose()
-    Remove-Item $wav
-} else {
+if (-not (Test-Path $wav)) {
     Add-Type -AssemblyName System.Speech
     $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
     $synth.Rate = [int]$cfg.sapiRate
+    $synth.SetOutputToWaveFile($wav)
     $synth.Speak($clean)
+    $synth.Dispose()
 }
 
-if ((Get-Content $pidFile) -eq $PID) { Remove-Item $pidFile }
+# Put silence in front of the speech. Audio devices (Bluetooth, USB, HDMI) take a moment to wake up
+# and drop whatever plays first.
+function Add-LeadIn($path, $ms) {
+    $bytes = [IO.File]::ReadAllBytes($path)
+    $pos = 12
+    $byteRate = $blockAlign = 0
+    while ($pos + 8 -le $bytes.Length) {
+        $id   = [Text.Encoding]::ASCII.GetString($bytes, $pos, 4)
+        $size = [BitConverter]::ToInt32($bytes, $pos + 4)
+        if ($id -eq 'fmt ') {
+            $byteRate   = [BitConverter]::ToInt32($bytes, $pos + 16)
+            $blockAlign = [BitConverter]::ToInt16($bytes, $pos + 20)
+        } elseif ($id -eq 'data') {
+            if ($blockAlign -le 0) { return }
+            $pad = [int]($byteRate * $ms / 1000)
+            $pad -= $pad % $blockAlign
+            $out = New-Object byte[] ($bytes.Length + $pad)
+            [Array]::Copy($bytes, $out, $pos + 8)
+            [Array]::Copy($bytes, $pos + 8, $out, $pos + 8 + $pad, $bytes.Length - $pos - 8)
+            [BitConverter]::GetBytes([int]($size + $pad)).CopyTo($out, $pos + 4)
+            [BitConverter]::GetBytes([int]($out.Length - 8)).CopyTo($out, 4)
+            [IO.File]::WriteAllBytes($path, $out)
+            return
+        }
+        $pos += 8 + $size + ($size % 2)
+    }
+}
+if ([int]$cfg.leadInMs -gt 0) { Add-LeadIn $wav ([int]$cfg.leadInMs) }
+
+# MediaPlayer rather than SoundPlayer because it can pause. speak.ps1 -Pause toggles $pauseFile.
+Add-Type -AssemblyName PresentationCore
+$player = New-Object System.Windows.Media.MediaPlayer
+$player.Open([Uri]$wav)
+$wait = [Diagnostics.Stopwatch]::StartNew()
+while (-not $player.NaturalDuration.HasTimeSpan -and $wait.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 20 }
+if ($player.NaturalDuration.HasTimeSpan) {
+    $length  = $player.NaturalDuration.TimeSpan
+    $played  = New-Object Diagnostics.Stopwatch  # playing time, so a stuck player can't keep this running
+    $playing = $false
+    while ($player.Position -lt $length -and $played.Elapsed -lt $length.Add([TimeSpan]::FromSeconds(5))) {
+        $paused = Test-Path $pauseFile
+        if ($paused -and $playing) { $player.Pause(); $played.Stop(); $playing = $false }
+        elseif (-not $paused -and -not $playing) { $player.Play(); $played.Start(); $playing = $true }
+        Start-Sleep -Milliseconds 50
+    }
+    $player.Close()
+} else {
+    $player.Close()
+    $fallback = New-Object System.Media.SoundPlayer $wav
+    $fallback.PlaySync()
+    $fallback.Dispose()
+}
+Remove-Item $wav
+
+if ((Get-Content $pidFile) -eq $PID) { Remove-Item $pidFile; Remove-Item $pauseFile }

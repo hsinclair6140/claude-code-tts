@@ -7,7 +7,8 @@ Windows voice. Everything runs offline once the engine and a voice are downloade
 Usage:
     claude-code-tts.exe              open the settings window
     claude-code-tts.exe --stop       stop the reply currently being read
-    claude-code-tts.exe --listen     run the stop hotkey listener (started at sign-in)
+    claude-code-tts.exe --pause      pause the reply being read, or resume it
+    claude-code-tts.exe --listen     run the hotkey listener (started at sign-in)
     claude-code-tts.exe --uninstall  remove the hook and all downloaded files
 """
 
@@ -30,7 +31,7 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 APP_NAME = "Claude Code TTS"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 CLAUDE_DIR = Path.home() / ".claude"
 SETTINGS_FILE = CLAUDE_DIR / "settings.json"
@@ -41,7 +42,7 @@ PIPER_EXE = TTS_DIR / "piper" / "piper.exe"
 VOICES_DIR = TTS_DIR / "voices"
 VOICES_CACHE = TTS_DIR / "voices.json"
 
-# The stop hotkey listener: a windowless background process started at sign-in.
+# The hotkey listener (stop and pause): a windowless background process started at sign-in.
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ClaudeCodeTTSHotkey"
 LISTENER_MUTEX = "Local\\ClaudeCodeTTSHotkeyListener"
@@ -65,8 +66,12 @@ DEFAULT_CONFIG = {
     "sapiRate": 1,
     "maxChars": 2000,
     "readCode": False,
+    "leadInMs": 750,
     "stopHotkey": "Ctrl+Alt+S",
+    "pauseHotkey": "Ctrl+Alt+P",
 }
+# Config key of each hotkey -> the id it's registered under (2 is taken by hotkey_available).
+HOTKEYS = {"stopHotkey": 1, "pauseHotkey": 3}
 
 HOTKEY_MODIFIERS = ["", "Ctrl", "Alt", "Shift", "Ctrl+Alt", "Ctrl+Shift", "Alt+Shift", "Ctrl+Alt+Shift"]
 MODIFIER_FLAGS = {"Alt": 0x1, "Ctrl": 0x2, "Shift": 0x4}  # MOD_ALT, MOD_CONTROL, MOD_SHIFT
@@ -263,10 +268,12 @@ def voice_label(voice_id, info):
 # Speaking
 # ---------------------------------------------------------------------------
 
-def run_speak(payload=None, stop=False):
+def run_speak(payload=None, stop=False, pause=False):
     args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SPEAK_SCRIPT)]
     if stop:
         args.append("-Stop")
+    if pause:
+        args.append("-Pause")
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, creationflags=NO_WINDOW)
     proc.stdin.write(json.dumps(payload or {}).encode("utf-8"))
     proc.stdin.close()
@@ -317,14 +324,15 @@ def kernel32():
 
 
 def listen_for_hotkey():
-    """Run the stop hotkey listener until the hotkey is turned off, the app is uninstalled,
+    """Run the hotkey listener until both hotkeys are turned off, the app is uninstalled,
     or stop_listener() is called. Picks up hotkey changes from config.json as they happen."""
     k32, user32 = kernel32(), ctypes.windll.user32
     mutex = k32.CreateMutexW(None, True, LISTENER_MUTEX)
     if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS: another listener is running
         return
     quit_event = wintypes.HANDLE(k32.CreateEventW(None, True, False, LISTENER_QUIT_EVENT))
-    registered = mtime = None
+    registered = dict.fromkeys(HOTKEYS.values())
+    mtime = None
     msg = wintypes.MSG()
     while True:
         try:
@@ -333,19 +341,21 @@ def listen_for_hotkey():
             break  # uninstalled
         if current != mtime:
             mtime = current
-            hotkey = load_config()["stopHotkey"]
-            if not split_hotkey(hotkey):
+            config = load_config()
+            if not any(split_hotkey(config[name]) for name in HOTKEYS):
                 break  # turned off
-            if hotkey != registered:
-                if registered:
-                    user32.UnregisterHotKey(None, 1)
-                registered = hotkey if register_hotkey(hotkey) else None
+            for name, hotkey_id in HOTKEYS.items():
+                hotkey = config[name] if split_hotkey(config[name]) else None
+                if hotkey != registered[hotkey_id]:
+                    if registered[hotkey_id]:
+                        user32.UnregisterHotKey(None, hotkey_id)
+                    registered[hotkey_id] = hotkey if hotkey and register_hotkey(hotkey, hotkey_id) else None
         # Wake on the quit event, a hotkey press, or every second to check config.json.
         if user32.MsgWaitForMultipleObjects(1, ctypes.byref(quit_event), False, 1000, 0x4FF) == 0:
             break
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
-            if msg.message == 0x312 and SPEAK_SCRIPT.exists():  # WM_HOTKEY
-                run_speak(stop=True)
+            if msg.message == 0x312 and SPEAK_SCRIPT.exists():  # WM_HOTKEY; wParam is the hotkey id
+                run_speak(stop=msg.wParam == HOTKEYS["stopHotkey"], pause=msg.wParam == HOTKEYS["pauseHotkey"])
     k32.ReleaseMutex(mutex)
 
 
@@ -364,18 +374,19 @@ def listener_command():
     return [str(pythonw if pythonw.exists() else sys.executable), str(Path(__file__).resolve()), "--listen"]
 
 
-def update_listener(hotkey):
-    """Start the listener at sign-in and now when hotkey is set; otherwise stop starting it.
-    A running listener exits by itself once config.json says the hotkey is off."""
+def update_listener(config):
+    """Start the listener at sign-in and now when a hotkey is set; otherwise stop starting it.
+    A running listener exits by itself once config.json says the hotkeys are off."""
+    wanted = any(split_hotkey(config.get(name)) for name in HOTKEYS)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        if split_hotkey(hotkey):
+        if wanted:
             winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, subprocess.list2cmdline(listener_command()))
         else:
             try:
                 winreg.DeleteValue(key, RUN_VALUE)
             except FileNotFoundError:
                 pass
-    if split_hotkey(hotkey) and not listener_running():
+    if wanted and not listener_running():
         subprocess.Popen(listener_command(), close_fds=True,
                          creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
 
@@ -400,7 +411,7 @@ def uninstall_everything():
         run_speak(stop=True)
     stop_listener()
     try:
-        update_listener("")
+        update_listener({})
     except OSError:
         pass
     try:
@@ -466,7 +477,7 @@ class App:
         self.refresh_status()
         if hook_installed():
             try:
-                update_listener(self.config["stopHotkey"])
+                update_listener(self.config)
             except OSError:
                 pass
         self.run_task("Loading voice list...", self.task_load_catalog)
@@ -557,20 +568,23 @@ class App:
         self.code_var = tk.BooleanVar(value=self.config["readCode"])
         ttk.Checkbutton(reading, text="Read code blocks (otherwise they are skipped)", variable=self.code_var,
                         command=self.on_change).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(reading, text="Stop hotkey:").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        hotkey = ttk.Frame(reading)
-        hotkey.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
-        self.hotkey_mod_var = tk.StringVar()
-        self.hotkey_key_var = tk.StringVar()
-        mod_box = ttk.Combobox(hotkey, textvariable=self.hotkey_mod_var, state="readonly", width=14,
-                               values=["Off", "Key only"] + HOTKEY_MODIFIERS[1:])
-        mod_box.pack(side="left")
-        ttk.Label(hotkey, text="+").pack(side="left", padx=4)
-        self.hotkey_key_box = ttk.Combobox(hotkey, textvariable=self.hotkey_key_var, state="readonly", width=4)
-        self.hotkey_key_box.pack(side="left")
-        for box in (mod_box, self.hotkey_key_box):
-            box.bind("<<ComboboxSelected>>", lambda e: self.on_hotkey_change())
-        self.show_hotkey(self.config["stopHotkey"])
+        # Each hotkey picker is (modifiers var, key var, key combobox), keyed by its config name.
+        self.hotkey_pickers = {}
+        for row, (name, label) in enumerate([("stopHotkey", "Stop hotkey:"), ("pauseHotkey", "Pause hotkey:")], 2):
+            ttk.Label(reading, text=label).grid(row=row, column=0, sticky="w", pady=(6, 0))
+            hotkey = ttk.Frame(reading)
+            hotkey.grid(row=row, column=1, sticky="w", padx=6, pady=(6, 0))
+            mod_var, key_var = tk.StringVar(), tk.StringVar()
+            mod_box = ttk.Combobox(hotkey, textvariable=mod_var, state="readonly", width=14,
+                                   values=["Off", "Key only"] + HOTKEY_MODIFIERS[1:])
+            mod_box.pack(side="left")
+            ttk.Label(hotkey, text="+").pack(side="left", padx=4)
+            key_box = ttk.Combobox(hotkey, textvariable=key_var, state="readonly", width=4)
+            key_box.pack(side="left")
+            for box in (mod_box, key_box):
+                box.bind("<<ComboboxSelected>>", lambda e, name=name: self.on_hotkey_change(name))
+            self.hotkey_pickers[name] = (mod_var, key_var, key_box)
+            self.show_hotkey(name, self.config[name])
 
         # Test
         test = ttk.LabelFrame(main, text="Test", padding=8)
@@ -579,7 +593,8 @@ class App:
         self.test_var = tk.StringVar(value="Hi! This is how Claude's replies will sound.")
         ttk.Entry(test, textvariable=self.test_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(test, text="Speak", command=self.on_test).grid(row=0, column=1, padx=(6, 0))
-        ttk.Button(test, text="Stop", command=self.on_stop).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(test, text="Pause", command=self.on_pause).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(test, text="Stop", command=self.on_stop).grid(row=0, column=3, padx=(6, 0))
 
         # Status bar
         status = ttk.Frame(main)
@@ -644,39 +659,45 @@ class App:
         self.update_slider_labels()
         self.status_var.set("Settings saved.")
 
-    def show_hotkey(self, hotkey):
+    def show_hotkey(self, name, hotkey):
+        mod_var, key_var, key_box = self.hotkey_pickers[name]
         parts = split_hotkey(hotkey)
         modifiers, key = parts or ("Off", "")
-        self.hotkey_mod_var.set(modifiers or "Key only")
-        self.hotkey_key_box.config(values=hotkey_keys(modifiers) if parts else [],
-                                   state="readonly" if parts else "disabled")
-        self.hotkey_key_var.set(key)
+        mod_var.set(modifiers or "Key only")
+        key_box.config(values=hotkey_keys(modifiers) if parts else [], state="readonly" if parts else "disabled")
+        key_var.set(key)
 
-    def selected_hotkey(self):
-        modifiers = self.hotkey_mod_var.get()
+    def selected_hotkey(self, name):
+        mod_var, key_var, _ = self.hotkey_pickers[name]
+        modifiers = mod_var.get()
         if modifiers == "Off":
             return ""
         modifiers = "" if modifiers == "Key only" else modifiers
         keys = hotkey_keys(modifiers)
-        key = self.hotkey_key_var.get()
-        key = key if key in keys else "F8" if "F8" in keys else keys[0]
+        key = key_var.get()
+        default = "F8" if name == "stopHotkey" else "F7"
+        key = key if key in keys else default if default in keys else keys[0]
         return f"{modifiers}+{key}" if modifiers else key
 
-    def on_hotkey_change(self):
-        old, hotkey = self.config["stopHotkey"], self.selected_hotkey()
-        if hotkey and hotkey != old and not hotkey_available(hotkey):
-            self.show_hotkey(old)
-            messagebox.showwarning(APP_NAME, f"{hotkey} is already used by another program. Pick a different key.")
+    def on_hotkey_change(self, name):
+        old, hotkey = self.config[name], self.selected_hotkey(name)
+        taken = hotkey and hotkey != old and any(self.config[n] == hotkey for n in HOTKEYS if n != name)
+        if taken or (hotkey and hotkey != old and not hotkey_available(hotkey)):
+            self.show_hotkey(name, old)
+            owner = "the other hotkey" if taken else "used by another program"
+            messagebox.showwarning(APP_NAME, f"{hotkey} is already {owner}. Pick a different key.")
             return
-        self.show_hotkey(hotkey)
-        self.config["stopHotkey"] = hotkey
+        self.show_hotkey(name, hotkey)
+        self.config[name] = hotkey
         save_config(self.config)
         try:
-            update_listener(hotkey)
+            update_listener(self.config)
         except OSError as e:
             messagebox.showerror(APP_NAME, f"Couldn't start the hotkey listener.\n\n{e}")
             return
-        self.status_var.set(f"Press {hotkey} anywhere to stop reading." if hotkey else "Stop hotkey turned off.")
+        action = "stop" if name == "stopHotkey" else "pause"
+        self.status_var.set(f"Press {hotkey} anywhere to {action} reading." if hotkey
+                            else f"{action.capitalize()} hotkey turned off.")
 
     # ---- voice list ----
     def fill_languages(self):
@@ -728,6 +749,10 @@ class App:
         self.on_change()
         run_speak({"last_assistant_message": self.test_var.get(), "claude_tts_test": True})
         self.status_var.set("Speaking...")
+
+    def on_pause(self):
+        if SPEAK_SCRIPT.exists():
+            run_speak(pause=True)
 
     def on_stop(self):
         if SPEAK_SCRIPT.exists():
@@ -842,7 +867,7 @@ class App:
             download_voice(voice_id, info, self.report_progress("Downloading voice:"))
         save_config(self.config)
         install_hook()
-        update_listener(self.config["stopHotkey"])
+        update_listener(self.config)
         self.events.put(("call", self.fill_voices))
         self.events.put(("status", "Installed. Restart Claude Code (or open /hooks) to start hearing replies."))
 
@@ -857,6 +882,10 @@ def main():
     if "--stop" in sys.argv:
         if SPEAK_SCRIPT.exists():
             run_speak(stop=True)
+        return
+    if "--pause" in sys.argv:
+        if SPEAK_SCRIPT.exists():
+            run_speak(pause=True)
         return
     if "--uninstall" in sys.argv:
         uninstall_everything()

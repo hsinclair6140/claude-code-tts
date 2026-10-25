@@ -38,7 +38,8 @@ Prefer no installer? Download the portable `claude-code-tts.exe` instead and run
 | Max characters | Long replies are cut off after this many characters (0 = no limit). |
 | Read code blocks | Off by default: code blocks are announced as "code block omitted". |
 | Stop hotkey | Press it anywhere in Windows to stop the reply being read. Default **Ctrl+Alt+S**; pick *Key only* for a single function key like **F8**, or *Off*. While set, the key does nothing else in other programs. A small background listener (`claude-code-tts.exe --listen`) starts at sign-in to catch it. You can also run `claude-code-tts.exe --stop`. |
-| Test | Type something and click **Speak** to hear the current settings. **Stop** silences the current reply. |
+| Pause hotkey | Press it to pause the reply being read, and again to resume. Default **Ctrl+Alt+P**; set it the same way as the stop hotkey. You can also run `claude-code-tts.exe --pause`. |
+| Test | Type something and click **Speak** to hear the current settings. **Pause** pauses or resumes it, **Stop** silences it. |
 | Remove hook | Stops Claude Code from speaking without uninstalling anything. |
 | Check for updates | Looks for a newer release on GitHub. The installed app downloads and runs the new installer; the portable exe opens the download page. |
 
@@ -54,7 +55,7 @@ All settings except the hook take effect immediately: they're stored in `~/.clau
     piper/                   Piper engine
     voices/                  downloaded voice models
     voices.json              cached voice catalog
-HKCU\...\CurrentVersion\Run  "ClaudeCodeTTSHotkey" starts the stop hotkey listener at sign-in
+HKCU\...\CurrentVersion\Run  "ClaudeCodeTTSHotkey" starts the hotkey listener at sign-in
 ```
 
 ## Uninstall
@@ -92,7 +93,7 @@ If you'd rather wire it up by hand:
 
    ```json
    { "enabled": true, "engine": "piper", "voice": "en_US-amy-medium",
-     "speed": 1.0, "sapiRate": 1, "maxChars": 2000, "readCode": false }
+     "speed": 1.0, "sapiRate": 1, "maxChars": 2000, "readCode": false, "leadInMs": 750 }
    ```
 
 ## Build from source
@@ -109,6 +110,7 @@ This runs the tests, then produces `dist\claude-code-tts.exe` (portable) and `di
 
 - **Nothing is spoken.** Make sure the app shows the hook as *Installed*, then restart Claude Code or open `/hooks`. Check that the master switch is on, and test with the **Speak** button.
 - **Robotic voice.** You're on the Windows engine, or the selected Piper voice isn't downloaded yet. Choose Piper and a voice with a ✓.
+- **The first words get cut off.** Some audio devices (Bluetooth, USB, HDMI) take a moment to wake up. Each reply starts with `leadInMs` of silence (750 ms by default); raise it in `~/.claude/tts/config.json` if words are still clipped.
 - **settings.json is not valid JSON.** The app refuses to edit a settings file it can't parse, so it never damages it. Fix the file (or restore `settings.json.bak`) and click **Install / Repair** again.
 
 ## Credits and licenses
